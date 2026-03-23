@@ -59,10 +59,14 @@ public class SpineScrewSimulation : MonoBehaviour
     public float drillDepth = 0.06f;
     [Tooltip("Max holes allowed.")]
     public int maxHoles = 10;
+    [Tooltip("Manual override for highlight disc radius. 0 = auto (holeRadius * 4). Set > 0 to force a specific size.")]
+    public float highlightRadius = 0f;
+    [Tooltip("Manual override for hole ring marker scale multiplier. 0 = auto (6x). Set > 0 to force.")]
+    public float ringScaleMultiplier = 0f;
 
     [Header("── Drill Physics ──")]
-    [Tooltip("Base drilling speed in depth-units/sec at zero resistance.")]
-    public float baseDrillRate = 0.06f;
+    [Tooltip("Base drilling speed in depth-units/sec at zero resistance. Lower = slower drill.")]
+    public float baseDrillRate = 0.025f;
     [Tooltip("How much the bone resists drilling overall (0=butter, 1=very hard).")]
     [Range(0f, 1f)]
     public float boneResistance = 0.55f;
@@ -96,6 +100,8 @@ public class SpineScrewSimulation : MonoBehaviour
 
     [Header("── Screw ──")]
     public GameObject screwPrefab;
+    [Tooltip("Assign a screwdriver model. It will attach to the screw head during screwing and rotate.")]
+    public GameObject screwDriverPrefab;
     public float screwLength = 0.20f;
     public float screwInsertSpeed = 0.15f;   // m/s
     public float screwSpinSpeed = 300f;    // deg/s
@@ -165,6 +171,10 @@ public class SpineScrewSimulation : MonoBehaviour
     bool _hasHit;
     RaycastHit _hit;
 
+    // Drill bit visual
+    GameObject _drillBitGO;
+    Material _drillBitMat;
+
     // Drill — physics-based state
     float _drillDepthCurrent;        // actual depth drilled so far (0 → drillDepth)
     float _drillVelocity;            // current drill velocity (depth/sec)
@@ -173,13 +183,20 @@ public class SpineScrewSimulation : MonoBehaviour
     ParticleSystem _dustPS;
     bool _isPinchHeldDrill;          // is pinch currently held during active drilling
 
+    // Done mode — 360 auto-rotate showcase
+    float _doneRotateAngle;          // accumulated rotation in Done mode
+    float _doneRotateSpeed = 30f;    // degrees per second
+    bool _doneShowcaseActive;
+
     // Holes
     class HoleData
     {
         public Vector3 pos, normal;
         public bool filled;
-        public GameObject outerRing, innerDisc;
+        public GameObject outerRing, midRing, innerDisc;
+        public GameObject holeCut;  // cylinder inside the bone showing the drilled channel
         public Material ringMat;
+        public GameObject finishedScrew;
     }
     readonly List<HoleData> _holes = new List<HoleData>();
 
@@ -188,6 +205,7 @@ public class SpineScrewSimulation : MonoBehaviour
     Material[] _heldMats;
     HoleData _snap;
     float _insertT;
+    GameObject _activeScrewDriver;
 
     // Misc
     AudioSource _audio;
@@ -337,6 +355,7 @@ public class SpineScrewSimulation : MonoBehaviour
             case Mode.Drilling: DoDrilling(kb, mouse, rightHand); break;
             case Mode.WaitForScrew: DoWait(kb, rightHand); break;
             case Mode.Screwing: DoScrewing(mouse, rightHand); break;
+            case Mode.Done: DoDoneShowcase(); break;
         }
 
         DrawPointer();
@@ -635,9 +654,11 @@ public class SpineScrewSimulation : MonoBehaviour
         if (_audio != null) { _audio.pitch = 1f; _audio.volume = 1f; }
         OneShot(doneSFX);
         _dustPS?.Stop();
+        _drillBitGO.SetActive(false);
 
         var h = new HoleData { pos = _drillPos, normal = _drillNormal };
         SpawnHoleMarkers(h);
+        SpawnHoleCut(h);
         _holes.Add(h);
 
         _drillDepthCurrent = 0f;
@@ -651,6 +672,7 @@ public class SpineScrewSimulation : MonoBehaviour
         StopAudio();
         if (_audio != null) { _audio.pitch = 1f; _audio.volume = 1f; }
         _dustPS?.Stop();
+        if (_drillBitGO) _drillBitGO.SetActive(false);
         _drillDepthCurrent = 0f;
         _drillVelocity = 0f;
         _mode = Mode.Free;
@@ -698,14 +720,16 @@ public class SpineScrewSimulation : MonoBehaviour
     void SpawnHoleMarkers(HoleData h)
     {
         float r = holeRadius;
+        // Use same disc radius as the drill highlight pointer
+        float discR = highlightRadius > 0f ? highlightRadius : holeRadius * 4f;
 
-        // Outer gold ring
+        // Outer gold ring — same size as drill highlight disc
         var ring = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
         ring.name = "HoleRing";
         Destroy(ring.GetComponent<Collider>());
         ring.transform.position = h.pos + h.normal * 0.002f;
         ring.transform.up = h.normal;
-        ring.transform.localScale = new Vector3(r * 6f, 0.001f, r * 6f);
+        ring.transform.localScale = new Vector3(discR, 0.001f, discR);
         var rm = new Material(Shader()) { color = new Color(1f, 0.85f, 0f) };
         ring.GetComponent<Renderer>().material = rm;
         h.outerRing = ring; h.ringMat = rm;
@@ -716,8 +740,9 @@ public class SpineScrewSimulation : MonoBehaviour
         Destroy(mid.GetComponent<Collider>());
         mid.transform.position = h.pos + h.normal * 0.003f;
         mid.transform.up = h.normal;
-        mid.transform.localScale = new Vector3(r * 3.5f, 0.0012f, r * 3.5f);
+        mid.transform.localScale = new Vector3(discR * 0.58f, 0.0012f, discR * 0.58f);
         mid.GetComponent<Renderer>().material = new Material(Shader()) { color = new Color(0.55f, 0.4f, 0f) };
+        h.midRing = mid;
 
         // Centre black hole disc — exact hole size
         var cen = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
@@ -731,19 +756,50 @@ public class SpineScrewSimulation : MonoBehaviour
         h.innerDisc = cen;
     }
 
+    /// <summary>
+    /// Spawn a dark cylinder that goes INTO the bone from the surface,
+    /// representing the drilled channel. Visible from outside as a hole.
+    /// </summary>
+    void SpawnHoleCut(HoleData h)
+    {
+        float r = holeRadius;
+        float depth = drillDepth;
+        float halfD = depth * 0.5f;
+
+        var cut = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        cut.name = "HoleCut";
+        Destroy(cut.GetComponent<Collider>());
+
+        // Position: centre of the channel — starts at surface, goes inward along -normal
+        cut.transform.position = h.pos - h.normal * (halfD - 0.001f);
+        cut.transform.up = h.normal;
+        cut.transform.localScale = new Vector3(r * 1.8f, halfD, r * 1.8f);
+
+        // Dark interior material to simulate the drilled channel
+        var cutMat = new Material(Shader());
+        cutMat.color = new Color(0.04f, 0.02f, 0.02f);
+        cut.GetComponent<Renderer>().material = cutMat;
+
+        h.holeCut = cut;
+    }
+
     void PulseRings()
     {
+        if (_mode == Mode.Done) return; // no highlights when done
+
         float p = 0.82f + 0.18f * Mathf.Sin(_pulse * 2.5f);
         float sp = 0.70f + 0.30f * Mathf.Sin(_pulse * 5.0f);
-        float r = holeRadius;
+        float discR = highlightRadius > 0f ? highlightRadius : holeRadius * 4f;
 
         foreach (var h in _holes)
         {
             if (h.ringMat == null) continue;
             if (h.filled)
             {
-                h.ringMat.color = new Color(0.4f, 0.4f, 0.45f);
-                if (h.outerRing) h.outerRing.transform.localScale = new Vector3(r * 6f, 0.001f, r * 6f);
+                // Filled holes: hide all markers (screw covers them)
+                if (h.outerRing && h.outerRing.activeSelf) h.outerRing.SetActive(false);
+                if (h.midRing && h.midRing.activeSelf) h.midRing.SetActive(false);
+                if (h.innerDisc && h.innerDisc.activeSelf) h.innerDisc.SetActive(false);
                 continue;
             }
             bool isSnap = h == _snap;
@@ -752,7 +808,7 @@ public class SpineScrewSimulation : MonoBehaviour
             h.ringMat.color = c * f;
             if (h.outerRing)
             {
-                float s = r * 6f * (isSnap ? 1f + 0.2f * Mathf.Sin(_pulse * 5f) : 1f + 0.07f * Mathf.Sin(_pulse * 2.5f));
+                float s = discR * (isSnap ? 1f + 0.2f * Mathf.Sin(_pulse * 5f) : 1f + 0.07f * Mathf.Sin(_pulse * 2.5f));
                 h.outerRing.transform.localScale = new Vector3(s, 0.001f, s);
             }
         }
@@ -782,9 +838,43 @@ public class SpineScrewSimulation : MonoBehaviour
             rends[i].material = _heldMats[i];
         }
         _snap = null; _insertT = 0f;
+
+        // Show screwdriver at the screw head
+        ShowScrewDriver();
     }
 
     void TintScrew(Color c) { if (_heldMats != null) foreach (var m in _heldMats) if (m) m.color = c; }
+
+    void ShowScrewDriver()
+    {
+        if (screwDriverPrefab == null) return;
+        if (_activeScrewDriver == null)
+        {
+            _activeScrewDriver = Instantiate(screwDriverPrefab);
+            _activeScrewDriver.name = "ActiveScrewDriver";
+        }
+        _activeScrewDriver.SetActive(true);
+    }
+
+    void HideScrewDriver()
+    {
+        if (_activeScrewDriver != null)
+            _activeScrewDriver.SetActive(false);
+    }
+
+    void PositionScrewDriver(Vector3 screwNormal)
+    {
+        if (_activeScrewDriver == null || _heldScrew == null) return;
+        // Place the screwdriver at the screw head (top of screw along its up axis)
+        float r = holeRadius;
+        float headOffset = screwLength + r * 3.5f;
+        Vector3 headWorldPos = _heldScrew.transform.position + _heldScrew.transform.up * headOffset;
+        _activeScrewDriver.transform.position = headWorldPos;
+        // Align screwdriver tip down toward the screw head
+        _activeScrewDriver.transform.rotation = Quaternion.LookRotation(
+            Vector3.Cross(_heldScrew.transform.up, _heldScrew.transform.right),
+            _heldScrew.transform.up);
+    }
 
     void DoScrewing(Mouse mouse, Hand rightHand)
     {
@@ -823,6 +913,9 @@ public class SpineScrewSimulation : MonoBehaviour
 
             _heldScrew.transform.position = Vector3.Lerp(_heldScrew.transform.position, targetPos, Time.deltaTime * 20f);
             _heldScrew.transform.rotation = Quaternion.Slerp(_heldScrew.transform.rotation, targetRot, Time.deltaTime * 20f);
+
+            // Position screwdriver at the screw head
+            PositionScrewDriver(n);
 
             // ── Drive screw: Leap twist gesture OR mouse LMB ──
             bool driving = false;
@@ -883,7 +976,7 @@ public class SpineScrewSimulation : MonoBehaviour
                             // Drive deeper only on clockwise twist
                             if (effectiveDelta > 0f)
                             {
-                                float insertRate = (effectiveDelta / 360f) * (screwInsertSpeed / screwLength) * 60f;
+                                float insertRate = (effectiveDelta / 360f) * (screwInsertSpeed / screwLength) * 4f;
                                 insertRate *= (1f - screwResist) * screwFricMod;
                                 _insertT += insertRate;
                                 _insertT = Mathf.Clamp01(_insertT);
@@ -903,7 +996,7 @@ public class SpineScrewSimulation : MonoBehaviour
                 driving = true;
                 float effectiveSpinSpeed = screwSpinSpeed * (1f - screwResist) * screwFricMod;
                 _heldScrew.transform.Rotate(n, effectiveSpinSpeed * Time.deltaTime, Space.World);
-                float effectiveInsertRate = (screwInsertSpeed / screwLength) * (1f - screwResist) * screwFricMod;
+                float effectiveInsertRate = (screwInsertSpeed / screwLength) * 0.25f * (1f - screwResist) * screwFricMod;
                 _insertT += effectiveInsertRate * Time.deltaTime;
                 _insertT = Mathf.Clamp01(_insertT);
             }
@@ -911,6 +1004,9 @@ public class SpineScrewSimulation : MonoBehaviour
             if (driving)
             {
                 LoopAudio(screwSFX);
+                // Rotate screwdriver while driving
+                if (_activeScrewDriver != null)
+                    _activeScrewDriver.transform.Rotate(_heldScrew.transform.up, screwSpinSpeed * Time.deltaTime, Space.World);
                 // Modulate audio by depth resistance
                 if (_audio.isPlaying)
                 {
@@ -975,15 +1071,72 @@ public class SpineScrewSimulation : MonoBehaviour
         StopAudio();
         if (_audio != null) { _audio.pitch = 1f; _audio.volume = 1f; }
         OneShot(doneSFX);
+
+        // Hide screwdriver — screw is fully inserted
+        HideScrewDriver();
+        Vector3 n = h.normal;
+        Vector3 right = Vector3.Cross(n, Vector3.up);
+        if (right.sqrMagnitude < 0.001f) right = Vector3.Cross(n, Vector3.forward);
+        right.Normalize();
+        Vector3 fwd = Vector3.Cross(right, n);
+        Vector3 finalPos = h.pos + n * (screwLength * 0.15f);
+        _heldScrew.transform.position = finalPos;
+        _heldScrew.transform.rotation = Quaternion.LookRotation(fwd, n);
+
+        // Parent to bone so screw moves/rotates with the skull
+        if (_bone != null)
+            _heldScrew.transform.SetParent(_bone.transform, true);
+
+        // Hide the hole markers since screw now covers them
+        if (h.outerRing) h.outerRing.SetActive(false);
+        if (h.midRing) h.midRing.SetActive(false);
+        if (h.innerDisc) h.innerDisc.SetActive(false);
+
         _heldScrew.name = "Screw_" + _holes.IndexOf(h);
+        h.finishedScrew = _heldScrew;
         _heldScrew = null;
         _snap = null;
 
         bool allDone = true;
         foreach (var hole in _holes) if (!hole.filled) { allDone = false; break; }
 
-        if (allDone) { _mode = Mode.Done; Debug.Log("[SpineSim] All screws inserted!"); }
+        if (allDone)
+        {
+            _mode = Mode.Done;
+            _doneShowcaseActive = true;
+            _doneRotateAngle = 0f;
+            Debug.Log("[SpineSim] All screws inserted! 360 showcase starting.");
+        }
         else { SpawnScrew(); }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  DONE — 360° AUTO-ROTATE SHOWCASE
+    // ─────────────────────────────────────────────────────────────
+
+    void DoDoneShowcase()
+    {
+        if (!_doneShowcaseActive) return;
+
+        _doneRotateAngle += _doneRotateSpeed * Time.deltaTime;
+
+        if (!embeddedMode && _pivot != null)
+        {
+            // Standalone: orbit the camera around the pivot
+            _yaw += _doneRotateSpeed * Time.deltaTime;
+        }
+        else if (_bone != null)
+        {
+            // Embedded: rotate the bone model itself for showcase
+            _bone.transform.RotateAround(
+                _boneBounds.center,
+                Vector3.up,
+                _doneRotateSpeed * Time.deltaTime);
+        }
+
+        // Loop continuously
+        if (_doneRotateAngle >= 360f)
+            _doneRotateAngle -= 360f;
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -1005,12 +1158,21 @@ public class SpineScrewSimulation : MonoBehaviour
         _discMat = new Material(Shader());
         _discGO.GetComponent<Renderer>().material = _discMat;
         _discGO.SetActive(false);
+
+        // Drill bit — metallic cylinder that penetrates into bone
+        _drillBitGO = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        _drillBitGO.name = "DrillBit";
+        Destroy(_drillBitGO.GetComponent<Collider>());
+        _drillBitMat = new Material(Shader()) { color = new Color(0.6f, 0.63f, 0.68f) };
+        _drillBitGO.GetComponent<Renderer>().material = _drillBitMat;
+        _drillBitGO.SetActive(false);
     }
 
     void DrawPointer()
     {
-        bool show = _mode == Mode.Free || _mode == Mode.WaitForScrew || _mode == Mode.Drilling;
-        if (!show) { _needleGO.SetActive(false); _discGO.SetActive(false); return; }
+        // Hide pointer when done (all screws placed)
+        bool show = _mode == Mode.Free || _mode == Mode.WaitForScrew || _mode == Mode.Drilling || _mode == Mode.Screwing;
+        if (!show) { _needleGO.SetActive(false); _discGO.SetActive(false); _drillBitGO.SetActive(false); return; }
 
         Vector3 pos; Vector3 nrm; Color col;
         if (_mode == Mode.Drilling)
@@ -1022,9 +1184,11 @@ public class SpineScrewSimulation : MonoBehaviour
         }
         else if (_mode == Mode.WaitForScrew)
         { pos = _drillPos; nrm = _drillNormal; col = new Color(0.3f, 1f, 0.3f); }
+        else if (_mode == Mode.Screwing && _snap != null)
+        { pos = _snap.pos; nrm = _snap.normal; col = new Color(0.2f, 1f, 0.35f); }
         else if (_hasHit)
         { pos = _hit.point; nrm = _hit.normal; col = new Color(1f, 1f, 0.1f); }
-        else { _needleGO.SetActive(false); _discGO.SetActive(false); return; }
+        else { _needleGO.SetActive(false); _discGO.SetActive(false); _drillBitGO.SetActive(false); return; }
 
         float nLen = _boneBounds.extents.magnitude * 0.4f;
         float nRad = holeRadius * 0.4f;
@@ -1037,11 +1201,38 @@ public class SpineScrewSimulation : MonoBehaviour
         _needleMat.color = col;
 
         _discGO.SetActive(true);
-        _discGO.transform.position = pos + nrm * 0.001f;
+        _discGO.transform.position = pos + nrm * 0.005f;
         _discGO.transform.up = nrm;
-        float dr = holeRadius * 4f * pls;
+        float discR = highlightRadius > 0f ? highlightRadius : holeRadius * 4f;
+        float dr = discR * pls;
         _discGO.transform.localScale = new Vector3(dr, 0.0005f, dr);
         _discMat.color = new Color(col.r, col.g, col.b, 0.8f);
+
+        // ── Drill bit penetration visual ──
+        if (_mode == Mode.Drilling && _drillDepthCurrent > 0f)
+        {
+            _drillBitGO.SetActive(true);
+            float bitRadius = holeRadius * 0.85f;
+            float bitLen = _drillDepthCurrent;
+            float halfBit = bitLen * 0.5f;
+            // Position: centre of the bit is halfway between surface and current depth
+            // The bit sticks out a little above surface and goes into the bone
+            float stickOut = Mathf.Min(drillDepth * 0.3f, 0.01f);
+            Vector3 bitCentre = _drillPos + _drillNormal * (stickOut - halfBit);
+            _drillBitGO.transform.position = bitCentre;
+            _drillBitGO.transform.up = _drillNormal;
+            _drillBitGO.transform.localScale = new Vector3(bitRadius * 2f, halfBit + stickOut, bitRadius * 2f);
+            // Spin the drill bit while driving
+            if (_isPinchHeldDrill)
+                _drillBitGO.transform.Rotate(_drillNormal, 720f * Time.deltaTime, Space.World);
+            // Colour: metallic with depth-based heat tint
+            float depthF = Mathf.Clamp01(_drillDepthCurrent / drillDepth);
+            _drillBitMat.color = Color.Lerp(new Color(0.6f, 0.63f, 0.68f), new Color(0.8f, 0.5f, 0.3f), depthF * 0.5f);
+        }
+        else
+        {
+            _drillBitGO.SetActive(false);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -1054,6 +1245,8 @@ public class SpineScrewSimulation : MonoBehaviour
         if (_audio != null) { _audio.pitch = 1f; _audio.volume = 1f; }
         _dustPS?.Stop();
         if (_heldScrew) { Destroy(_heldScrew); _heldScrew = null; }
+        HideScrewDriver();
+        if (_drillBitGO) _drillBitGO.SetActive(false);
         _snap = null;
         _twistActive = false;
         _twistAccumulated = 0f;
@@ -1071,9 +1264,13 @@ public class SpineScrewSimulation : MonoBehaviour
         foreach (var h in _holes)
         {
             if (h.outerRing) Destroy(h.outerRing);
+            if (h.midRing) Destroy(h.midRing);
             if (h.innerDisc) Destroy(h.innerDisc);
+            if (h.holeCut) Destroy(h.holeCut);
+            if (h.finishedScrew) Destroy(h.finishedScrew);
         }
         _holes.Clear();
+        if (_activeScrewDriver) { Destroy(_activeScrewDriver); _activeScrewDriver = null; }
         foreach (var go in FindObjectsOfType<GameObject>())
             if (go && go.name.StartsWith("Screw_")) Destroy(go);
         foreach (var go in FindObjectsOfType<GameObject>())
@@ -1114,8 +1311,8 @@ public class SpineScrewSimulation : MonoBehaviour
         screwLength = Mathf.Clamp(sz * 0.45f, 0.02f, 1.5f);
         snapRadius = Mathf.Clamp(sz * 0.35f, 0.02f, 1.5f);
         drillDepth = Mathf.Clamp(sz * 0.20f, 0.01f, 0.5f);
-        screwInsertSpeed = Mathf.Clamp(sz * 0.35f, 0.02f, 1f);
-        baseDrillRate = Mathf.Clamp(drillDepth * 0.8f, 0.01f, 0.3f);
+        screwInsertSpeed = Mathf.Clamp(sz * 0.15f, 0.01f, 0.3f);
+        baseDrillRate = Mathf.Clamp(drillDepth * 0.35f, 0.005f, 0.08f);
         minHoleSpacing = Mathf.Max(holeRadius * 3f, 0.01f);
         _dist = Mathf.Clamp(sz * 3.0f, minDist, maxDist);
 
@@ -1367,17 +1564,15 @@ public class SpineScrewSimulation : MonoBehaviour
             GUI.Label(new UnityEngine.Rect(sw / 2f - 200, sh * 0.61f + 24, 400, 22), "Pinch/E = more holes   |   Grab/S = start screwing", a2);
         }
 
-        // Done overlay
+        // Done banner (non-blocking — 360 rotating showcase continues behind)
         if (_mode == Mode.Done)
         {
-            Rect(new UnityEngine.Rect(0, 0, sw, sh), new Color(0, 0, 0, 0.5f));
-            float pw = 460, ph = 190, px = sw / 2f - 230, py = sh / 2f - 95;
-            Rect(new UnityEngine.Rect(px, py, pw, ph), new Color(0.04f, 0.1f, 0.06f, 0.97f));
-            Rect(new UnityEngine.Rect(px, py, pw, 4), new Color(0.3f, 1f, 0.5f));
-            GUI.Label(new UnityEngine.Rect(px, py + 16, pw, 38), "SIMULATION COMPLETE", _sBig);
+            Rect(new UnityEngine.Rect(0, 0, sw, 56), new Color(0.02f, 0.08f, 0.04f, 0.88f));
+            Rect(new UnityEngine.Rect(0, 54, sw, 2), new Color(0.3f, 1f, 0.5f));
+            GUI.Label(new UnityEngine.Rect(12, 8, sw - 200, 28), "SIMULATION COMPLETE", _sBig);
             var sb = new GUIStyle(_sBody); sb.normal.textColor = new Color(0.75f, 0.95f, 0.8f);
-            GUI.Label(new UnityEngine.Rect(px, py + 62, pw, 24), $"All {_holes.Count} screws inserted.", sb);
-            if (GUI.Button(new UnityEngine.Rect(px + pw / 2f - 90, py + 128, 180, 42), "↺  Reset Simulation"))
+            GUI.Label(new UnityEngine.Rect(12, 32, sw - 200, 20), $"All {_holes.Count} screws inserted  —  360\u00b0 showcase", sb);
+            if (GUI.Button(new UnityEngine.Rect(sw - 170, 10, 150, 36), "Reset"))
                 ResetAll();
             if (embeddedMode) GUI.EndGroup();
             return;
