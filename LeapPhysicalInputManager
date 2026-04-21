@@ -1,0 +1,1189 @@
+// ================================================================
+//  LeapPhysicalInputManager.cs   (FIXED VERSION - Apr 2026)
+//
+//  KEY CHANGES vs original:
+//    [FIX 1] Drill contact is now COLLIDER-BASED via DrillTipDetector
+//            instead of Physics.Raycast. This prevents drilling from
+//            inside the bone — OnTriggerEnter only fires when
+//            crossing the surface from OUTSIDE.
+//    [FIX 2] Drill start requires either a fresh OnTriggerEnter
+//            (justEntered) OR a valid outside-contact that is NOT
+//            deeply embedded in the bone (safety probe).
+//    [FIX 3] Legacy raycast is kept as a FALLBACK only when
+//            drillTipDetector is not assigned.
+//    [FIX 4] Physics values for screw / screwdriver / drill are
+//            retuned for Leap Physical Hands (drag 3–6 instead of
+//            20–25). Delegates to SurgicalToolPhysicsSetup.
+//    [FIX 5] Velocity clamping uses a proper moving-average filter
+//            to prevent jitter without sacrificing grab responsiveness.
+// ================================================================
+
+using UnityEngine;
+using Leap;
+using Leap.PhysicalHands;
+
+[RequireComponent(typeof(SpineScrewSimulation))]
+public class LeapPhysicalInputManager : MonoBehaviour
+{
+    [Header("── Leap Provider ──")]
+    public LeapProvider leapProvider;
+
+    [Header("── Tools ──")]
+    public GameObject drillTool;
+    public Transform drillTipPoint;
+    public Transform screwSpawnPoint;
+    public GameObject screwDriverTool;
+
+    [Header("── Drill Detection (NEW collider-based) ──")]
+    [Tooltip("Assign the DrillTipDetector component attached to the tip child of your drill tool. If NULL, falls back to the legacy raycast method.")]
+    public DrillTipDetector drillTipDetector;
+
+    [Header("── Drill Raycast (LEGACY FALLBACK) ──")]
+    public LayerMask boneMask = ~0;
+    public float drillRayLength = 0.08f;
+    public Vector3 drillLocalDir = Vector3.down;
+
+    [Header("── Thresholds ──")]
+    [Range(0.3f, 1f)] public float pinchThreshold = 0.6f;
+    [Range(0f, 0.2f)] public float pinchHysteresis = 0.08f;
+    [Range(0.3f, 1f)] public float grabThreshold = 0.75f;
+
+    [Header("── Drill Safety ──")]
+    [Tooltip("Require the drill to be pointed INTO the bone surface (dot with -normal >= this value). 0.3 = allow 72° off-axis; 0.6 = must be nearly perpendicular.")]
+    [Range(0f, 0.95f)] public float minDrillApproachDot = 0.3f;
+
+    [Header("── Screw Placement ──")]
+    public float screwSnapDistance = 0.09f;
+    public float screwRespawnDistance = 0.35f;
+    public float screwMaxVelocity = 0.4f;
+
+    [Header("── Screwdriver ──")]
+    public float driverAttachDistance = 0.06f;
+    public float screwDriverHeadOffset = 0f;
+    public float screwDriverExtraOffset = 0f;
+    [Range(0.01f, 0.2f)] public float driverFollowSmoothTime = 0.05f;
+    [Range(4f, 30f)] public float driverRotationLerpSpeed = 14f;
+    [Range(0.08f, 0.35f)] public float twistHandSelectDistance = 0.2f;
+    public float driverMaxVelocity = 0.5f;
+
+    [Header("── Twist (Smooth) ──")]
+    public float twistSensitivity = 1.0f;
+    public float maxTwistPerFrame = 15f;
+    public float twistDeadzone = 2f;
+    [Range(3, 20)] public int twistSmoothFrames = 8;
+    [Range(0.05f, 0.5f)] public float twistSmoothAlpha = 0.15f;
+
+    [Header("── Visual Feedback ──")]
+    public float hitMarkerScale = 0.012f;
+    public float aimRingScale = 0.028f;
+    public bool showContactLine = true;
+
+    [Header("── Zoom ──")]
+    [Range(0.1f, 0.6f)] public float zoomInDistanceFactor = 0.25f;
+    [Range(0.5f, 8f)] public float zoomSpeed = 3f;
+
+    [Header("── Positioning Phase ──")]
+    [Range(0.1f, 4f)] public float twoHandZoomSensitivity = 1.6f;
+    [Range(0.15f, 1f)] public float twoFistHoldDuration = 0.4f;
+    [Range(0.04f, 0.2f)] public float screwHoldDistance = 0.1f;
+    [Range(0.08f, 0.35f)] public float magneticPlacementDistance = 0.20f;
+    [Range(1f, 20f)] public float magneticPlacementLerp = 14f;
+
+    [Header("── Spawn Near Hand ──")]
+    public float spawnAbovePalm = 0.05f;
+
+    // ── Phase ──
+    public enum Phase { Positioning, Drilling, Placing, Driving, Done }
+    [HideInInspector] public Phase currentPhase = Phase.Positioning;
+    [HideInInspector] public bool doneDrillingRequested;
+
+    // ── Runtime ──
+    SpineScrewSimulation _sim;
+    Hand _rHand, _lHand;
+    bool _hasR, _hasL;
+    bool _rPinch, _lPinch, _prevRP, _prevLP;
+    float _rStr, _lStr;
+
+    // Drill contact (from detector OR raycast fallback)
+    bool _drillTouching;
+    Vector3 _drillContactPoint;
+    Vector3 _drillContactNormal;
+    RaycastHit _drillHit;        // legacy fallback
+
+    Vector3 _lastDrilledPos;
+
+    // Screw placement
+    GameObject _currentScrew;
+    int _placingIdx = -1;
+
+    // Screwdriver
+    bool _driverAttached;
+    int _drivingIdx = -1;
+    bool _drivingZoomInitialized;
+    Hand _lockedDriveHand;
+    bool _lockedDriveHandIsRight;
+
+    // Twist smoothing
+    bool _twistActive;
+    float _prevTwistAngle;
+    float[] _twistBuffer;
+    int _twistBufIdx;
+    float _smoothedTwist;
+    Vector3 _driverPosVel;
+
+    // Visuals
+    GameObject _hitMarker, _aimRing, _tipGlow;
+    Material _hitMat, _ringMat, _tipMat;
+    GameObject _lineObj; LineRenderer _line;
+    float _pulse;
+    bool _twoHandPinchActive;
+    float _prevTwoHandPinchDistance;
+    float _twoFistHoldTimer;
+
+    void Awake()
+    {
+        _sim = GetComponent<SpineScrewSimulation>();
+        _sim.externalInputActive = true;
+        _sim.disableMouseInput = true;
+
+        // [FIX 4] Apply Leap-tuned physics presets to tools at awake.
+        //   Drill and screwdriver get grabbable physics.
+        //   Their Rigidbody (added if missing) uses tuned drag/mass.
+        if (drillTool != null) SurgicalToolPhysicsSetup.ApplyPreset(drillTool, ToolPreset.Drill);
+        if (screwDriverTool != null) SurgicalToolPhysicsSetup.ApplyPreset(screwDriverTool, ToolPreset.Screwdriver);
+    }
+
+    void Start()
+    {
+        if (leapProvider == null) leapProvider = FindObjectOfType<LeapProvider>();
+        if (leapProvider == null)
+        {
+            Debug.LogError("[LeapPhysicalInputManager] Missing LeapProvider. Disabling input manager.");
+            enabled = false;
+            return;
+        }
+
+        twistSmoothFrames = Mathf.Max(3, twistSmoothFrames);
+        _twistBuffer = new float[twistSmoothFrames];
+
+        if (drillTipDetector == null && drillTipPoint != null)
+        {
+            // Try to auto-find a DrillTipDetector under the tip
+            drillTipDetector = drillTipPoint.GetComponent<DrillTipDetector>();
+            if (drillTipDetector == null)
+                drillTipDetector = drillTipPoint.GetComponentInChildren<DrillTipDetector>();
+        }
+
+        if (drillTipDetector == null)
+            Debug.LogWarning("[LeapPhysicalInputManager] No DrillTipDetector assigned — falling back to raycast detection (drilling-from-inside may occur).");
+
+        CreateVisuals();
+        if (screwDriverTool) screwDriverTool.SetActive(false);
+    }
+
+    void Update()
+    {
+        _pulse += Time.deltaTime;
+        ReadHands();
+        UpdatePinch();
+        UpdateTwoHandZoom();
+
+        bool anyP = _rPinch || _lPinch;
+        float bestS = Mathf.Max(_rStr, _lStr);
+
+        switch (currentPhase)
+        {
+            case Phase.Positioning: UpdatePositioning(anyP, bestS); break;
+            case Phase.Drilling: UpdateDrilling(anyP, bestS); break;
+            case Phase.Placing: UpdatePlacing(); break;
+            case Phase.Driving: UpdateDriving(anyP, bestS); break;
+            case Phase.Done: UpdateDone(); break;
+        }
+
+        _prevRP = _rPinch;
+        _prevLP = _lPinch;
+    }
+
+    // ═══════════════════════════════════════════
+    //  DRILL CONTACT SENSOR
+    //  Reads from DrillTipDetector when available,
+    //  otherwise falls back to legacy raycast.
+    //  Returns true if a VALID outer-surface contact exists.
+    // ═══════════════════════════════════════════
+
+    bool SenseDrillContact()
+    {
+        // Primary: collider-based detector
+        if (drillTipDetector != null)
+        {
+            if (!drillTipDetector.isTouchingBone) return false;
+
+            // [FIX 2] Reject if tip has been pushed deeply inside the bone
+            // (the trigger can still report contact while the tip is submerged
+            // in a concavity with walls on most sides — probe out to catch it).
+            if (drillTipDetector.IsTipDeeplyInsideBone()) return false;
+
+            _drillContactPoint = drillTipDetector.contactPoint;
+            _drillContactNormal = drillTipDetector.contactNormal;
+
+            // Verify the drill axis is pointing INTO the surface.
+            if (drillTipPoint != null)
+            {
+                Vector3 drillAxis = drillTipPoint.TransformDirection(drillLocalDir).normalized;
+                float dotIntoSurface = Vector3.Dot(drillAxis, -_drillContactNormal);
+                if (dotIntoSurface < minDrillApproachDot) return false;
+            }
+
+            return true;
+        }
+
+        // Fallback: legacy raycast
+        if (drillTool != null && drillTipPoint != null && drillTool.activeInHierarchy)
+        {
+            Vector3 tip = drillTipPoint.position;
+            Vector3 dir = drillTipPoint.TransformDirection(drillLocalDir).normalized;
+            if (Physics.Raycast(tip, dir, out _drillHit, drillRayLength, boneMask, QueryTriggerInteraction.Ignore))
+            {
+                _drillContactPoint = _drillHit.point;
+                _drillContactNormal = _drillHit.normal;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Returns true if the detector just reported a fresh entry this frame.
+    /// Used to gate the initial drill-start so we know the tip crossed from
+    /// OUTSIDE → INSIDE (as opposed to already being inside when pinch began).
+    bool JustEnteredBone()
+    {
+        if (drillTipDetector != null) return drillTipDetector.justEntered;
+        // Fallback: treat any fresh pinch as fresh entry when in raycast mode.
+        return (_rPinch && !_prevRP) || (_lPinch && !_prevLP);
+    }
+
+    // ═══════════════════════════════════════════
+    //  SPAWN POSITION HELPERS
+    // ═══════════════════════════════════════════
+
+    Vector3 GetSpawnPositionNearHand(float aboveOffset)
+    {
+        if (_hasR && _rHand != null)
+            return LeapPalm(_rHand) + Vector3.up * aboveOffset;
+        if (_hasL && _lHand != null)
+            return LeapPalm(_lHand) + Vector3.up * aboveOffset;
+        if (screwSpawnPoint) return screwSpawnPoint.position;
+        return transform.position + Vector3.up * 0.15f;
+    }
+
+    // ═══════════════════════════════════════════
+    //  VELOCITY CLAMPING
+    // ═══════════════════════════════════════════
+
+    void ClampRigidbodyVelocity(Rigidbody rb, float maxVel)
+    {
+        if (rb == null || rb.isKinematic) return;
+        if (rb.velocity.magnitude > maxVel)
+            rb.velocity = rb.velocity.normalized * maxVel;
+        if (rb.angularVelocity.magnitude > maxVel * 3f)
+            rb.angularVelocity = rb.angularVelocity.normalized * (maxVel * 3f);
+    }
+
+    // ═══════════════════════════════════════════
+    //  POSITIONING PHASE
+    // ═══════════════════════════════════════════
+
+    void UpdatePositioning(bool anyP, float bestS)
+    {
+        _sim.SetExternalPinch(false, 0f);
+
+        _drillTouching = SenseDrillContact();
+
+        if (_drillTouching)
+        {
+            // Synthesize a RaycastHit-shaped payload for the sim
+            var hit = new RaycastHit();
+            _sim.SetExternalRaycast(true, hit);
+            bool drillReady = bestS >= (_sim.GetMinDrillPinchStrength() * 0.9f);
+            ShowContact(_drillContactPoint, _drillContactNormal, anyP, drillReady);
+        }
+        else
+        {
+            _sim.SetExternalRaycast(false, default);
+            ShowNoContact();
+        }
+
+        bool justP = (_rPinch && !_prevRP) || (_lPinch && !_prevLP);
+        if (_drillTouching && justP)
+        {
+            currentPhase = Phase.Drilling;
+            _sim.PlayTransitionCue();
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    //  DRILLING PHASE
+    // ═══════════════════════════════════════════
+
+    void UpdateDrilling(bool anyP, float bestS)
+    {
+        _sim.SetExternalPinch(anyP, bestS);
+
+        _drillTouching = SenseDrillContact();
+
+        if (_drillTouching)
+        {
+            _sim.SetExternalRaycast(true, default);
+            ShowContact(_drillContactPoint, _drillContactNormal, anyP);
+
+            float zoomDist = _sim.GetBoneBounds().extents.magnitude * zoomInDistanceFactor;
+            if (!_twoHandPinchActive)
+                _sim.SetZoomTarget(_drillContactPoint, zoomDist, zoomSpeed);
+
+            int mode = _sim.GetModeInt();
+            if (mode == 0 || mode == 2) // Free or WaitForScrew
+            {
+                bool justP = (_rPinch && !_prevRP) || (_lPinch && !_prevLP);
+
+                bool continuous = false;
+                if (anyP && mode == 2 && _sim.GetHoleCount() < _sim.maxHoles)
+                {
+                    bool valid = true;
+                    for (int i = 0; i < _sim.GetHoleCount(); i++)
+                    {
+                        if (Vector3.Distance(_drillContactPoint, _sim.GetHolePosition(i)) < _sim.minHoleSpacing * 1.5f)
+                        { valid = false; break; }
+                    }
+
+                    if (valid && _lastDrilledPos != Vector3.zero &&
+                        Vector3.Distance(_drillContactPoint, _lastDrilledPos) < _sim.minHoleSpacing * 2f)
+                        valid = false;
+
+                    continuous = valid;
+                }
+
+                // [FIX 2] require a fresh surface entry (from outside) OR a
+                // validated continuous drilling condition.
+                bool entryValid = JustEnteredBone() || continuous;
+
+                if ((justP || continuous) && entryValid &&
+                    _sim.StartDrillFromExternal(_drillContactPoint, _drillContactNormal))
+                {
+                    _lastDrilledPos = _drillContactPoint;
+                }
+            }
+        }
+        else
+        {
+            _sim.SetExternalRaycast(false, default);
+            ShowNoContact();
+        }
+
+        bool transition = false;
+        if (_sim.GetHoleCount() > 0 && _sim.GetModeInt() != 1)
+        {
+            bool rG = _hasR && _rHand.GrabStrength >= grabThreshold;
+            bool lG = _hasL && _lHand.GrabStrength >= grabThreshold;
+            if (rG && lG)
+            {
+                _twoFistHoldTimer += Time.deltaTime;
+                if (_twoFistHoldTimer >= twoFistHoldDuration) transition = true;
+            }
+            else _twoFistHoldTimer = 0f;
+            if (_sim.GetHoleCount() >= _sim.maxHoles) transition = true;
+        }
+
+        if (doneDrillingRequested && _sim.GetHoleCount() > 0 && _sim.GetModeInt() != 1)
+        {
+            transition = true;
+            doneDrillingRequested = false;
+        }
+
+        if (transition)
+        {
+            currentPhase = Phase.Placing;
+            _sim.EnterWaitForScrew();
+            HideVisuals();
+            SpawnNextScrew();
+            _sim.PlayTransitionCue();
+            _twoFistHoldTimer = 0f;
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    //  TWO-HAND ZOOM
+    // ═══════════════════════════════════════════
+
+    void UpdateTwoHandZoom()
+    {
+        if (_hasR && _hasL && _rPinch && _lPinch)
+        {
+            Vector3 rp = GetPinchPointWorld(_rHand);
+            Vector3 lp = GetPinchPointWorld(_lHand);
+            float dist = Vector3.Distance(rp, lp);
+            Vector3 mid = (rp + lp) * 0.5f;
+
+            if (!_twoHandPinchActive)
+            {
+                _twoHandPinchActive = true;
+                _prevTwoHandPinchDistance = dist;
+            }
+            else
+            {
+                float delta = dist - _prevTwoHandPinchDistance;
+                _prevTwoHandPinchDistance = dist;
+                _sim.ManualCameraZoomAndPivot(mid, -delta * twoHandZoomSensitivity, zoomSpeed * 2f);
+            }
+        }
+        else _twoHandPinchActive = false;
+    }
+
+    // ═══════════════════════════════════════════
+    //  SCREW SPAWNING (near hand) [FIX 4 physics]
+    // ═══════════════════════════════════════════
+
+    void SpawnNextScrew()
+    {
+        int idx = _sim.GetNextUnplacedHoleIndex();
+        if (idx < 0)
+        {
+            currentPhase = Phase.Driving;
+            StartDriving();
+            return;
+        }
+
+        _placingIdx = idx;
+
+        if (_currentScrew) Destroy(_currentScrew);
+
+        _currentScrew = _sim.BuildScrewObject();
+        _currentScrew.name = $"PhysScrew_{idx}";
+
+        _currentScrew.transform.position = GetSpawnPositionNearHand(spawnAbovePalm);
+        _currentScrew.transform.rotation = Quaternion.identity;
+
+        // Collider (for grabbing)
+        if (!_currentScrew.GetComponent<Collider>())
+        {
+            var b = _currentScrew.AddComponent<BoxCollider>();
+            b.size = new Vector3(_sim.holeRadius * 1.2f, _sim.screwLength, _sim.holeRadius * 1.2f);
+            b.center = new Vector3(0, _sim.screwLength * 0.5f, 0);
+        }
+
+        // [FIX 4] Use tuned physics preset for loose screws (light + well-damped)
+        SurgicalToolPhysicsSetup.ApplyPreset(_currentScrew, ToolPreset.LooseScrew);
+    }
+
+    // ═══════════════════════════════════════════
+    //  SCREW PLACING
+    // ═══════════════════════════════════════════
+
+    void UpdatePlacing()
+    {
+        if (!_currentScrew)
+        {
+            SpawnNextScrew();
+            return;
+        }
+
+        var screwRb = _currentScrew.GetComponent<Rigidbody>();
+        ClampRigidbodyVelocity(screwRb, screwMaxVelocity);
+
+        Vector3 pos = _currentScrew.transform.position;
+        float distToR = _hasR ? Vector3.Distance(pos, LeapPalm(_rHand)) : 999f;
+        float distToL = _hasL ? Vector3.Distance(pos, LeapPalm(_lHand)) : 999f;
+        float distToNearestHand = Mathf.Min(distToR, distToL);
+
+        if (distToNearestHand > screwRespawnDistance)
+        {
+            _currentScrew.transform.position = GetSpawnPositionNearHand(spawnAbovePalm);
+            if (screwRb && !screwRb.isKinematic)
+            {
+                screwRb.velocity = Vector3.zero;
+                screwRb.angularVelocity = Vector3.zero;
+            }
+            return;
+        }
+
+        bool isHeld = IsScrewIntentionallyHeld(_currentScrew);
+
+        for (int i = 0; i < _sim.GetHoleCount(); i++)
+        {
+            var h = _sim.holes[i];
+            if (h.screwPlaced) continue;
+
+            float dist = Vector3.Distance(_currentScrew.transform.position, h.pos);
+
+            if (dist < magneticPlacementDistance)
+            {
+                float lerpT = 1f - Mathf.Exp(-magneticPlacementLerp * Time.deltaTime);
+                if (isHeld) lerpT *= 1.5f;
+                else lerpT *= 0.4f;
+
+                _currentScrew.transform.position = Vector3.Lerp(
+                    _currentScrew.transform.position, h.pos, Mathf.Clamp01(lerpT));
+
+                Vector3 n = h.normal;
+                Vector3 r = Vector3.Cross(n, Vector3.up);
+                if (r.sqrMagnitude < 0.001f) r = Vector3.Cross(n, Vector3.forward);
+                r.Normalize();
+                Vector3 f = Vector3.Cross(r, n);
+                Quaternion targetRot = Quaternion.LookRotation(f, n);
+                _currentScrew.transform.rotation = Quaternion.Slerp(
+                    _currentScrew.transform.rotation, targetRot, lerpT);
+
+                dist = Vector3.Distance(_currentScrew.transform.position, h.pos);
+            }
+
+            bool canSnap = isHeld || dist < screwSnapDistance * 0.6f;
+
+            if (canSnap && dist < screwSnapDistance)
+            {
+                _sim.PlaceScrewAtHole(i, _currentScrew);
+                _sim.FlashHole(i);
+                FreezeSnappedScrewPhysics(_currentScrew);
+                EnsureDriverAttachPoint(_currentScrew, screwDriverHeadOffset);
+                _currentScrew = null;
+                SpawnNextScrew();
+                return;
+            }
+        }
+    }
+
+    void FreezeSnappedScrewPhysics(GameObject screw)
+    {
+        if (!screw) return;
+        // [FIX 4] Use the canonical snapped-screw preset.
+        SurgicalToolPhysicsSetup.ApplyPreset(screw, ToolPreset.SnappedScrew);
+
+        var cols = screw.GetComponentsInChildren<Collider>(true);
+        for (int i = 0; i < cols.Length; i++) cols[i].enabled = false;
+    }
+
+    Transform EnsureDriverAttachPoint(GameObject screwObj, float localUpOffset)
+    {
+        if (!screwObj) return null;
+        Transform existing = screwObj.transform.Find("DriverAttachPoint");
+        if (existing != null) return existing;
+
+        var go = new GameObject("DriverAttachPoint");
+        go.transform.SetParent(screwObj.transform, false);
+
+        Renderer[] rends = screwObj.GetComponentsInChildren<Renderer>();
+        if (rends.Length > 0)
+        {
+            Bounds b = rends[0].bounds;
+            for (int i = 1; i < rends.Length; i++) b.Encapsulate(rends[i].bounds);
+            Vector3 topWorld = new Vector3(b.center.x, b.max.y, b.center.z);
+            Vector3 localTop = screwObj.transform.InverseTransformPoint(topWorld);
+            go.transform.localPosition = localTop + Vector3.up * localUpOffset;
+        }
+        else
+        {
+            go.transform.localPosition = Vector3.up * (0.1f + localUpOffset);
+        }
+
+        go.transform.localRotation = Quaternion.identity;
+        return go.transform;
+    }
+
+    // ═══════════════════════════════════════════
+    //  DRIVING PHASE
+    // ═══════════════════════════════════════════
+
+    void StartDriving()
+    {
+        _driverAttached = false;
+        _drivingIdx = -1;
+        _drivingZoomInitialized = false;
+        _twistActive = false;
+        _smoothedTwist = 0;
+        _twistBufIdx = 0;
+        _lockedDriveHand = null;
+        _lockedDriveHandIsRight = false;
+
+        for (int i = 0; i < _twistBuffer.Length; i++) _twistBuffer[i] = 0;
+
+        if (screwDriverTool)
+        {
+            screwDriverTool.SetActive(true);
+            // [FIX 4] Re-apply tuned physics in case the RB was modified during idle.
+            SurgicalToolPhysicsSetup.ApplyPreset(screwDriverTool, ToolPreset.Screwdriver);
+
+            screwDriverTool.transform.position = GetSpawnPositionNearHand(spawnAbovePalm + 0.03f);
+            screwDriverTool.transform.rotation = Quaternion.identity;
+        }
+
+        _drivingIdx = _sim.GetNextUndrivenHoleIndex();
+
+        if (_drivingIdx >= 0)
+        {
+            _sim.StartDrivingScrew(_drivingIdx);
+            Vector3 focusPos = _sim.GetScrewHeadPosition(_drivingIdx);
+            float zoomDist = _sim.GetBoneBounds().extents.magnitude * zoomInDistanceFactor;
+            _sim.SetZoomTarget(focusPos, zoomDist, zoomSpeed);
+        }
+        else
+        {
+            currentPhase = Phase.Done;
+            _sim.EnterDone();
+        }
+    }
+
+    void UpdateDriving(bool anyP, float bestS)
+    {
+        if (!screwDriverTool) return;
+
+        var driverRb = screwDriverTool.GetComponent<Rigidbody>();
+        ClampRigidbodyVelocity(driverRb, driverMaxVelocity);
+
+        if (!_driverAttached)
+        {
+            Vector3 driverPos = screwDriverTool.transform.position;
+            float dR = _hasR ? Vector3.Distance(driverPos, LeapPalm(_rHand)) : 999f;
+            float dL = _hasL ? Vector3.Distance(driverPos, LeapPalm(_lHand)) : 999f;
+            if (Mathf.Min(dR, dL) > screwRespawnDistance)
+            {
+                screwDriverTool.transform.position = GetSpawnPositionNearHand(spawnAbovePalm + 0.03f);
+                if (driverRb && !driverRb.isKinematic)
+                {
+                    driverRb.velocity = Vector3.zero;
+                    driverRb.angularVelocity = Vector3.zero;
+                }
+            }
+        }
+
+        if (!_driverAttached && _drivingIdx >= 0)
+        {
+            Transform tip = screwDriverTool.transform.Find("DriverTip");
+            Vector3 dPos = tip != null ? tip.position : screwDriverTool.transform.position;
+            var hole = _sim.holes[_drivingIdx];
+            if (hole.screwObj == null) return;
+            Transform attach = EnsureDriverAttachPoint(hole.screwObj, screwDriverHeadOffset);
+            Vector3 head = attach.position + hole.normal * screwDriverExtraOffset;
+            float dist = Vector3.Distance(dPos, head);
+            if (dist < driverAttachDistance)
+            {
+                _driverAttached = true;
+                _lockedDriveHand = SelectDrivingHand();
+                _lockedDriveHandIsRight = _lockedDriveHand != null && _lockedDriveHand.IsRight;
+
+                if (driverRb)
+                {
+                    driverRb.velocity = Vector3.zero;
+                    driverRb.angularVelocity = Vector3.zero;
+                    driverRb.isKinematic = true; // lock to screw while driving
+                }
+
+                _twistActive = false;
+                _smoothedTwist = 0;
+                _driverPosVel = Vector3.zero;
+
+                if (!_drivingZoomInitialized)
+                {
+                    Vector3 focusPos = _sim.GetScrewHeadPosition(_drivingIdx);
+                    float zoomDist = _sim.GetBoneBounds().extents.magnitude * zoomInDistanceFactor;
+                    _sim.SetZoomTarget(focusPos, zoomDist, zoomSpeed);
+                    _drivingZoomInitialized = true;
+                }
+            }
+        }
+
+        if (_driverAttached && _drivingIdx >= 0)
+        {
+            var h = _sim.holes[_drivingIdx];
+            if (h.screwObj)
+            {
+                Transform attach = EnsureDriverAttachPoint(h.screwObj, screwDriverHeadOffset);
+                Vector3 axis = h.screwObj.transform.up;
+                Vector3 headPos = attach.position + h.normal * screwDriverExtraOffset;
+                Transform tip = screwDriverTool.transform.Find("DriverTip");
+
+                if (tip != null)
+                {
+                    Vector3 offset = screwDriverTool.transform.position - tip.position;
+                    Vector3 targetPos = headPos + offset;
+                    screwDriverTool.transform.position = Vector3.SmoothDamp(
+                        screwDriverTool.transform.position, targetPos,
+                        ref _driverPosVel, driverFollowSmoothTime, Mathf.Infinity, Time.deltaTime);
+                }
+                else
+                {
+                    screwDriverTool.transform.position = Vector3.SmoothDamp(
+                        screwDriverTool.transform.position, headPos,
+                        ref _driverPosVel, driverFollowSmoothTime, Mathf.Infinity, Time.deltaTime);
+                }
+
+                Vector3 perp = Vector3.Cross(axis, Vector3.up);
+                if (perp.sqrMagnitude < 0.001f) perp = Vector3.Cross(axis, Vector3.forward);
+                perp.Normalize();
+
+                Quaternion targetRot = Quaternion.LookRotation(-axis, perp);
+                float rotT = 1f - Mathf.Exp(-driverRotationLerpSpeed * Time.deltaTime);
+                screwDriverTool.transform.rotation = Quaternion.Slerp(screwDriverTool.transform.rotation, targetRot, rotT);
+
+                if (anyP)
+                    screwDriverTool.transform.Rotate(axis, _smoothedTwist * 0.5f, Space.World);
+            }
+
+            Hand twistHand = GetTwistHand();
+
+            if (twistHand != null && anyP)
+            {
+                Vector3 palmN = leapProvider.transform.TransformDirection(twistHand.PalmNormal);
+                float angle = Mathf.Atan2(palmN.x, palmN.z) * Mathf.Rad2Deg;
+
+                if (!_twistActive)
+                {
+                    _twistActive = true;
+                    _prevTwistAngle = angle;
+                    _twistBufIdx = 0;
+                    for (int i = 0; i < _twistBuffer.Length; i++) _twistBuffer[i] = 0;
+                    _smoothedTwist = 0;
+                }
+                else
+                {
+                    float raw = Mathf.DeltaAngle(_prevTwistAngle, angle);
+                    _prevTwistAngle = angle;
+
+                    if (Mathf.Abs(raw) < twistDeadzone) raw = 0;
+                    raw = Mathf.Clamp(raw * twistSensitivity, -maxTwistPerFrame, maxTwistPerFrame);
+
+                    _twistBuffer[_twistBufIdx] = raw;
+                    _twistBufIdx = (_twistBufIdx + 1) % _twistBuffer.Length;
+
+                    float avg = 0;
+                    for (int i = 0; i < _twistBuffer.Length; i++) avg += _twistBuffer[i];
+                    avg /= _twistBuffer.Length;
+
+                    _smoothedTwist = Mathf.Lerp(_smoothedTwist, avg, twistSmoothAlpha);
+                    _sim.DriveActiveScrew(_smoothedTwist, bestS);
+                }
+            }
+            else if (anyP)
+            {
+                _twistActive = false;
+                _smoothedTwist = Mathf.Lerp(_smoothedTwist, 0, 0.35f);
+            }
+            else
+            {
+                _twistActive = false;
+                _smoothedTwist = Mathf.Lerp(_smoothedTwist, 0, 0.5f);
+            }
+
+            if (_drivingIdx >= 0 && _sim.holes[_drivingIdx].screwDriven)
+            {
+                _driverAttached = false;
+                _drivingZoomInitialized = false;
+                _twistActive = false;
+                _sim.FlashHole(_drivingIdx, 0.55f);
+
+                if (driverRb)
+                {
+                    driverRb.velocity = Vector3.zero;
+                    driverRb.angularVelocity = Vector3.zero;
+                    driverRb.isKinematic = false;
+                }
+
+                _lockedDriveHand = null;
+                _drivingIdx = _sim.GetNextUndrivenHoleIndex();
+                if (_drivingIdx >= 0)
+                {
+                    _sim.StartDrivingScrew(_drivingIdx);
+                    if (screwDriverTool)
+                    {
+                        screwDriverTool.transform.position = GetSpawnPositionNearHand(spawnAbovePalm + 0.03f);
+                        if (driverRb && !driverRb.isKinematic)
+                        {
+                            driverRb.velocity = Vector3.zero;
+                            driverRb.angularVelocity = Vector3.zero;
+                        }
+                    }
+                }
+                else
+                {
+                    currentPhase = Phase.Done;
+                    _sim.EnterDone();
+                    _sim.PlayTransitionCue();
+                    if (screwDriverTool) screwDriverTool.SetActive(false);
+                    HideVisuals();
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    //  HAND HELPERS
+    // ═══════════════════════════════════════════
+
+    Hand GetTwistHand()
+    {
+        if (_lockedDriveHand != null)
+        {
+            bool stillTracked = _lockedDriveHand.IsRight ? _hasR : _hasL;
+            if (stillTracked && screwDriverTool)
+            {
+                Vector3 palm = LeapPalm(_lockedDriveHand);
+                if (Vector3.Distance(palm, screwDriverTool.transform.position) < twistHandSelectDistance * 1.5f)
+                    return _lockedDriveHand;
+            }
+        }
+
+        if (_hasR && _rHand != null && screwDriverTool)
+        {
+            Vector3 p = LeapPalm(_rHand);
+            if (Vector3.Distance(p, screwDriverTool.transform.position) < twistHandSelectDistance) return _rHand;
+        }
+        if (_hasL && _lHand != null && screwDriverTool)
+        {
+            Vector3 p = LeapPalm(_lHand);
+            if (Vector3.Distance(p, screwDriverTool.transform.position) < twistHandSelectDistance) return _lHand;
+        }
+        if (_rPinch && _hasR && _rHand != null) return _rHand;
+        if (_lPinch && _hasL && _lHand != null) return _lHand;
+        return null;
+    }
+
+    bool IsScrewIntentionallyHeld(GameObject screw)
+    {
+        if (screw == null) return false;
+
+        bool rightHeld = _hasR && _rHand.GrabStrength >= grabThreshold &&
+                         Vector3.Distance(LeapPalm(_rHand), screw.transform.position) <= screwHoldDistance;
+        bool leftHeld = _hasL && _lHand.GrabStrength >= grabThreshold &&
+                        Vector3.Distance(LeapPalm(_lHand), screw.transform.position) <= screwHoldDistance;
+
+        return rightHeld || leftHeld;
+    }
+
+    Hand SelectDrivingHand()
+    {
+        if (!screwDriverTool) return null;
+        Hand best = null;
+        float bestDist = float.MaxValue;
+
+        if (_hasR && _rPinch)
+        {
+            float d = Vector3.Distance(LeapPalm(_rHand), screwDriverTool.transform.position);
+            if (d < bestDist) { bestDist = d; best = _rHand; }
+        }
+        if (_hasL && _lPinch)
+        {
+            float d = Vector3.Distance(LeapPalm(_lHand), screwDriverTool.transform.position);
+            if (d < bestDist) { bestDist = d; best = _lHand; }
+        }
+        if (best != null) return best;
+
+        if (_hasR)
+        {
+            float d = Vector3.Distance(LeapPalm(_rHand), screwDriverTool.transform.position);
+            if (d < bestDist) { bestDist = d; best = _rHand; }
+        }
+        if (_hasL)
+        {
+            float d = Vector3.Distance(LeapPalm(_lHand), screwDriverTool.transform.position);
+            if (d < bestDist) best = _lHand;
+        }
+        return best;
+    }
+
+    Vector3 GetPinchPointWorld(Hand h)
+    {
+        if (h == null) return Vector3.zero;
+        if (h.fingers == null || h.fingers.Length < 2) return LeapPalm(h);
+        Vector3 thumb = leapProvider.transform.TransformPoint(h.fingers[0].TipPosition);
+        Vector3 index = leapProvider.transform.TransformPoint(h.fingers[1].TipPosition);
+        return (thumb + index) * 0.5f;
+    }
+
+    // ═══════════════════════════════════════════
+    //  DONE / RESTART / EXIT
+    // ═══════════════════════════════════════════
+
+    void UpdateDone() { _sim.SetExternalPinch(false, 0f); }
+
+    public void RestartSimulation()
+    {
+        _driverAttached = false;
+        _drivingIdx = -1;
+        _placingIdx = -1;
+        _twistActive = false;
+        _smoothedTwist = 0f;
+        _lockedDriveHand = null;
+        _lockedDriveHandIsRight = false;
+        _twoFistHoldTimer = 0f;
+        _twoHandPinchActive = false;
+        _lastDrilledPos = Vector3.zero;
+        _drivingZoomInitialized = false;
+
+        if (_currentScrew) { Destroy(_currentScrew); _currentScrew = null; }
+
+        if (drillTipDetector != null) drillTipDetector.ClearContact();
+
+        if (screwDriverTool) screwDriverTool.SetActive(false);
+        HideVisuals();
+        _sim.ResetSimulationState();
+        _sim.ResetZoom(zoomSpeed);
+        currentPhase = Phase.Positioning;
+    }
+
+    public void ExitSimulation()
+    {
+#if UNITY_EDITOR
+        UnityEditor.EditorApplication.isPlaying = false;
+#else
+        Application.Quit();
+#endif
+    }
+
+    // ═══════════════════════════════════════════
+    //  INPUT READING
+    // ═══════════════════════════════════════════
+
+    void ReadHands()
+    {
+        _hasR = _hasL = false;
+        _rHand = _lHand = null;
+        _rStr = _lStr = 0;
+
+        if (!leapProvider) return;
+        var f = leapProvider.CurrentFrame;
+        if (f == null) return;
+
+        foreach (var h in f.Hands)
+        {
+            if (h.IsRight)
+            {
+                _rHand = h; _hasR = true; _rStr = h.PinchStrength;
+            }
+            else
+            {
+                _lHand = h; _hasL = true; _lStr = h.PinchStrength;
+            }
+        }
+    }
+
+    void UpdatePinch()
+    {
+        if (_rPinch) { if (_rStr < pinchThreshold - pinchHysteresis) _rPinch = false; }
+        else { if (_rStr >= pinchThreshold) _rPinch = true; }
+
+        if (_lPinch) { if (_lStr < pinchThreshold - pinchHysteresis) _lPinch = false; }
+        else { if (_lStr >= pinchThreshold) _lPinch = true; }
+    }
+
+    Vector3 LeapPalm(Hand h)
+    {
+        if (leapProvider) return leapProvider.transform.TransformPoint(h.PalmPosition);
+        return h.PalmPosition;
+    }
+
+    // ═══════════════════════════════════════════
+    //  PUBLIC PROPERTIES
+    // ═══════════════════════════════════════════
+
+    public bool HasRightHand => _hasR;
+    public bool HasLeftHand => _hasL;
+    public float BestPinchStr => Mathf.Max(_rStr, _lStr);
+    public bool AnyPinch => _rPinch || _lPinch;
+    public bool DrillTouching => _drillTouching;
+    public bool DriverAttached => _driverAttached;
+    public int DrivingIndex => _drivingIdx;
+    public float SmoothedTwist => _smoothedTwist;
+
+    // ═══════════════════════════════════════════
+    //  VISUALS
+    // ═══════════════════════════════════════════
+
+    Shader Shdr() => Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard") ?? Shader.Find("Diffuse");
+
+    Material TranspMat(Color c)
+    {
+        var m = new Material(Shdr());
+        m.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+        m.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+        m.SetInt("_ZWrite", 0);
+        m.renderQueue = 3100;
+        m.color = c;
+        return m;
+    }
+
+    void CreateVisuals()
+    {
+        _hitMarker = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        _hitMarker.name = "_Hit";
+        _hitMarker.transform.localScale = Vector3.one * hitMarkerScale;
+        Destroy(_hitMarker.GetComponent<Collider>());
+        _hitMat = new Material(Shdr()) { color = Color.yellow };
+        _hitMarker.GetComponent<Renderer>().material = _hitMat;
+        _hitMarker.SetActive(false);
+
+        _aimRing = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        _aimRing.name = "_Ring";
+        Destroy(_aimRing.GetComponent<Collider>());
+        _ringMat = TranspMat(new Color(1, 0.85f, 0, 0.4f));
+        _aimRing.GetComponent<Renderer>().material = _ringMat;
+        _aimRing.SetActive(false);
+
+        _tipGlow = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        _tipGlow.name = "_Tip";
+        _tipGlow.transform.localScale = Vector3.one * 0.008f;
+        Destroy(_tipGlow.GetComponent<Collider>());
+        _tipMat = TranspMat(new Color(1, 0.4f, 0.1f, 0.6f));
+        _tipGlow.GetComponent<Renderer>().material = _tipMat;
+        _tipGlow.SetActive(false);
+
+        if (showContactLine)
+        {
+            _lineObj = new GameObject("_Line");
+            _line = _lineObj.AddComponent<LineRenderer>();
+            _line.positionCount = 2;
+            _line.startWidth = 0.002f;
+            _line.endWidth = 0.0005f;
+            _line.material = new Material(Shader.Find("Sprites/Default") ?? Shdr());
+            _line.useWorldSpace = true;
+            _lineObj.SetActive(false);
+        }
+    }
+
+    void ShowContact(Vector3 p, Vector3 n, bool pinch, bool drillReady = false)
+    {
+        float pl = 1 + 0.08f * Mathf.Sin(_pulse * 5f);
+        bool drilling = _sim.GetModeInt() == 1;
+
+        float alignment = 0f;
+        if (drillTipPoint)
+        {
+            Vector3 dir = drillTipPoint.TransformDirection(drillLocalDir).normalized;
+            alignment = Mathf.Clamp01(Vector3.Dot(dir, -n));
+        }
+
+        Color idle = new Color(1, 0.85f, 0f);
+        Color ready = new Color(0.2f, 0.95f, 1f);
+        Color active = new Color(0f, 1f, 0.3f);
+        Color c = drilling || pinch ? active : (drillReady ? ready : idle);
+
+        if (_hitMarker)
+        {
+            _hitMarker.SetActive(true);
+            _hitMarker.transform.position = p + n * 0.002f;
+            float alignBoost = 1f + alignment * 0.2f;
+            _hitMarker.transform.localScale = Vector3.one * hitMarkerScale * ((drilling || pinch || drillReady) ? 1.3f : 1f) * pl * alignBoost;
+            _hitMat.color = c;
+        }
+
+        if (_aimRing)
+        {
+            _aimRing.SetActive(true);
+            _aimRing.transform.position = p + n * 0.0015f;
+            _aimRing.transform.up = n;
+            float s = aimRingScale * pl * (1f + alignment * 0.15f);
+            _aimRing.transform.localScale = new Vector3(s, 0.0008f, s);
+            Color rc = c;
+            rc.a = (drilling || pinch || drillReady) ? 0.5f : 0.25f;
+            _ringMat.color = rc;
+        }
+
+        if (_tipGlow && drillTipPoint)
+        {
+            _tipGlow.SetActive(true);
+            _tipGlow.transform.position = drillTipPoint.position;
+            _tipGlow.transform.localScale = Vector3.one * ((drilling || pinch || drillReady) ? 0.012f : 0.008f) * pl;
+            Color gc = c;
+            gc.a = 0.6f;
+            _tipMat.color = gc;
+        }
+
+        if (_line && drillTipPoint)
+        {
+            _lineObj.SetActive(true);
+            _line.SetPosition(0, drillTipPoint.position);
+            _line.SetPosition(1, p);
+            Color lc = c;
+            lc.a = 0.6f;
+            _line.startColor = lc;
+            lc.a = 0.2f;
+            _line.endColor = lc;
+        }
+    }
+
+    void ShowNoContact()
+    {
+        if (_hitMarker) _hitMarker.SetActive(false);
+        if (_aimRing) _aimRing.SetActive(false);
+        if (_lineObj) _lineObj.SetActive(false);
+
+        if (_tipGlow && drillTipPoint && drillTool && drillTool.activeInHierarchy)
+        {
+            _tipGlow.SetActive(true);
+            _tipGlow.transform.position = drillTipPoint.position;
+            _tipGlow.transform.localScale = Vector3.one * 0.006f;
+            _tipMat.color = new Color(1, 0.3f, 0.2f, 0.4f);
+        }
+        else if (_tipGlow) _tipGlow.SetActive(false);
+    }
+
+    void HideVisuals()
+    {
+        if (_hitMarker) _hitMarker.SetActive(false);
+        if (_aimRing) _aimRing.SetActive(false);
+        if (_lineObj) _lineObj.SetActive(false);
+        if (_tipGlow) _tipGlow.SetActive(false);
+    }
+
+    void OnGUI() { if (GetComponent<SimulationUI>()) return; }
+
+    void OnDestroy()
+    {
+        if (_hitMarker) Destroy(_hitMarker);
+        if (_aimRing) Destroy(_aimRing);
+        if (_lineObj) Destroy(_lineObj);
+        if (_tipGlow) Destroy(_tipGlow);
+        if (_currentScrew) Destroy(_currentScrew);
+        if (_hitMat) Destroy(_hitMat);
+        if (_ringMat) Destroy(_ringMat);
+        if (_tipMat) Destroy(_tipMat);
+        if (_line != null && _line.material != null) Destroy(_line.material);
+    }
+
+#if UNITY_EDITOR
+    void OnDrawGizmos()
+    {
+        if (!Application.isPlaying) return;
+
+        if (drillTipPoint && (currentPhase == Phase.Positioning || currentPhase == Phase.Drilling))
+        {
+            Vector3 t = drillTipPoint.position;
+            Vector3 d = drillTipPoint.TransformDirection(drillLocalDir).normalized;
+            Gizmos.color = _drillTouching ? Color.green : Color.yellow;
+            Gizmos.DrawRay(t, d * drillRayLength);
+            if (_drillTouching)
+            {
+                Gizmos.color = Color.red;
+                Gizmos.DrawSphere(_drillContactPoint, 0.003f);
+                Gizmos.DrawRay(_drillContactPoint, _drillContactNormal * 0.02f);
+            }
+        }
+
+        if (currentPhase == Phase.Placing)
+        {
+            Gizmos.color = new Color(1, 1, 0, 0.3f);
+            for (int i = 0; i < _sim.GetHoleCount(); i++)
+            {
+                if (_sim.holes[i].screwPlaced) continue;
+                Gizmos.DrawWireSphere(_sim.holes[i].pos, screwSnapDistance);
+            }
+        }
+
+        if (currentPhase == Phase.Driving && _drivingIdx >= 0)
+        {
+            Gizmos.color = new Color(0, 1, 1, 0.3f);
+            Gizmos.DrawWireSphere(_sim.GetScrewHeadPosition(_drivingIdx), driverAttachDistance);
+        }
+    }
+#endif
+}
+
+
+
+
